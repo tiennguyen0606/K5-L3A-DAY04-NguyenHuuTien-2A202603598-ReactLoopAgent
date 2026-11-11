@@ -3,3 +3,9 @@
 __pycache__/
 *.pyc
 eval_results*.json
+
+# Local drafts / experiments (not for submission)
+*_backup.json
+agent_before_weak.py
+agent_improved.py
+reeval_openrouter.ps1

@@ -1,6 +1,8 @@
-"""Bốn provider cùng một interface. Không chứa agent loop."""
+"""Provider adapters cùng một interface. Không chứa agent loop."""
 import json
 import os
+import re
+import time
 import urllib.error
 import urllib.request
 
@@ -9,19 +11,36 @@ CONFIG = {
     'gemini': ('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'),
     'openrouter': ('OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1/chat/completions'),
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
+    'groq': ('GROQ_API_KEY', 'https://api.groq.com/openai/v1/chat/completions'),
 }
 
 
-def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+def post_json(url, headers, payload, retries=4):
+    # Groq/Cloudflare rejects Python-urllib default User-Agent (403 error 1010).
+    merged = {'Content-Type': 'application/json', 'User-Agent': 'StatusAgentLab/1.0', **headers}
+    last_error = None
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=merged)
+        try:
+            with urllib.request.urlopen(req, timeout=180) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            body = ''
+            try:
+                body = exc.read().decode('utf-8', errors='replace')[:500]
+            except Exception:
+                body = ''
+            if exc.code == 429 and attempt + 1 < retries:
+                match = re.search(r'try again in ([0-9]+(?:\.[0-9]+)?)s', body, re.I)
+                wait = float(match.group(1)) + 1.5 if match else 5.0 * (attempt + 1)
+                time.sleep(min(wait, 60))
+                last_error = RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota. — {body}')
+                continue
+            detail = f' — {body}' if body else ''
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.{detail}') from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    raise last_error or RuntimeError('Provider request failed after retries.')
 
 
 class Provider:
@@ -44,7 +63,8 @@ class Provider:
     def complete(self, messages, schemas):
         if self.name == 'anthropic':
             return self._anthropic(messages, schemas)
-        payload = {'model': self.model, 'messages': messages}
+        # Groq free OTPM for some models (e.g. qwen) is 1000; default 2048 triggers 429.
+        payload = {'model': self.model, 'messages': messages, 'max_tokens': 900}
         if schemas:
             payload['tools'] = schemas
         data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
